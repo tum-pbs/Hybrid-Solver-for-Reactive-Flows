@@ -1,7 +1,7 @@
 # ----------------------------------------------------------------------------
 #
-# Phiflow chemical reaction solver framework
-# Copyright 2020 Nilam T, Nils Thuerey
+# Planar-v0 hybrid NN-PDE  framework
+# Copyright 2023 Nilam T, Nils Thuerey
 #
 # This program is free software, distributed under the terms of the
 # Apache License, Version 2.0
