@@ -1,13 +1,13 @@
 # ----------------------------------------------------------------------------
 #
-# Phiflow chemical reaction Makefile
+# Planar-v0 Makefile
 # Copyright 2023 Nilam T, Nils Thuerey
 #
 # This program is free software, distributed under the terms of the
 # Apache License, Version 2.0
 # http://www.apache.org/licenses/LICENSE-2.0
 #
-# Chemical Reaction examples
+#
 #
 # ----------------------------------------------------------------------------
 
@@ -27,7 +27,7 @@ planar-v0-react-testset: data_generation.py
 	done
 ################################################################################
 # Training models
-
+# Hybrid NN-PDE
 # SOL-2
 P-v0-hyb-unet-sol2: hybrid_nn_pde_train_unet_v1.py
 	python $^ --tf $@/tf --log $@/tf/run.log --epochs=100 --lr 0.0001 -l 100 -t 300 -m 2 -n 6 -b 3 --seed 0 --gpu '0' --cuda \
@@ -37,11 +37,29 @@ P-v0-hyb-unet-sol16: hybrid_nn_pde_train_unet_v1.py
 	python $^ --tf $@/tf --log $@/tf/run.log --epochs=200 --resume=100 --lr 0.0001 -l 100 -t 300 -m 32 -n 6 -b 3 --seed 0 --gpu '0' --cuda \
 		--train planar-v0-react-set
 
+# Purely data-driven
+P-v0-pdd-resnet-sol2: pdd_train_resnet.py
+	python $^ --tf $@/tf --log $@/tf/run.log --epochs=100 --lr 0.0001 -l 100 -t 300 -m 2 -n 6 -b 3 --seed 0 --gpu '0' --cuda \
+		--train planar-v0-react-set
+
+P-v0-pdd-resnet-sol16: pdd_train_resnet.py
+	python $^ --tf $@/tf --log $@/tf/run.log --epochs=200 --resume=100 --lr 0.0001 -l 100 -t 300 -m 32 -n 6 -b 3 --seed 0 --gpu '0' --cuda \
+		--train planar-v0-react-set
+
 ################################################################################
 # Run tests
 
 # SOL-2
 P-v0-hyb-unet-sol2/run_test: hybrid_nn_pde_apply_v1.py
+	for i in `seq 0 1`; do \
+		 python $^ -o $@ \
+		    --stats `dirname $@`/tf/dataStats.pickle \
+            --model `dirname $@`/tf/model.h5 --gpu "-1" \
+            --testset planar-v0-react-testset \
+            -r 32 -b 3 --bIdx `echo "($$i) " | bc -l` -l 100 -t 300; \
+	done
+
+P-v0-pdd-resnet-sol2/run_test: pdd_apply.py
 	for i in `seq 0 1`; do \
 		 python $^ -o $@ \
 		    --stats `dirname $@`/tf/dataStats.pickle \

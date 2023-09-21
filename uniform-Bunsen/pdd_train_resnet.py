@@ -1,6 +1,6 @@
 # ----------------------------------------------------------------------------
 #
-# nonUniform-Bunsen100 hybrid NN-PDE framework
+# uniform-Bunsen PDD framework
 # Copyright 2023 Nilam T, Nils Thuerey
 #
 # This program is free software, distributed under the terms of the
@@ -12,17 +12,7 @@
 # ----------------------------------------------------------------------------
 
 import os, sys, logging, argparse, pickle, glob, random, distutils.dir_util
-from solver_class_train_new import SpEnergy, SpFluid
-
-fuel_type = 'methane'
-if fuel_type == 'methane':
-    hk, cp = 5.01E7, 1450
-    Wf, Wo, Wp = 0.016, 0.032, 0.062
-    Vf, Vo = -1, -2
-elif fuel_type == 'propane':
-    hk, cp = 4.66E7, 1300
-    Wf, Wo, Wp = 0.044, 0.032, 0.062
-    Vf, Vo = -1, -5
+from solver_class_train import SpFluid
 
 log = logging.getLogger()
 log.addHandler(logging.StreamHandler())
@@ -35,10 +25,9 @@ parser.add_argument('--cuda',           action='store_true',       help='enable 
 parser.add_argument('--train',          default=None,              help='training; will load data from this simulation folder (no reaction)')
 parser.add_argument('--skip-ds',        action='store_true',       help='skip down-scaling; assume you have already saved')
 parser.add_argument('--only-ds',        action='store_true',       help='exit after down-scaling and saving; use only for data pre-processing')
-parser.add_argument('--res',       default=100, type=int,    help='resolution of the reference axis')
+parser.add_argument('--res',       default=32, type=int,    help='resolution of the reference axis')
 parser.add_argument('--log',            default=None,              help='path to a log file')
 parser.add_argument('-s', '--scale',    default=4, type=int,       help='simulation scale for high-res')
-parser.add_argument('--bx',       default=1, type=float,   help='length of combustion chamber (box)')
 parser.add_argument('-n', '--nsims',    default=1, type=int,       help='number of simulations')
 parser.add_argument('-b', '--sbatch',   default=1, type=int,       help='size of a batch; when 10 simulations with the size of 5, 5 simulations are into two batches')
 parser.add_argument('-t', '--simsteps', default=299, type=int,    help='simulation steps; # of data samples (i.e. frames) per simulation')
@@ -46,7 +35,7 @@ parser.add_argument('-m', '--msteps',   default=2, type=int,       help='multi s
 parser.add_argument('-e', '--epochs',   default=10, type=int,      help='training epochs')
 parser.add_argument('--seed',           default=None, type=int,    help='seed for random number generator')
 parser.add_argument('-l', '--len',      default=100, type=int,     help='length of the reference axis')  # FIXME: save and restore from the data
-parser.add_argument('--model',          default='unet',       help='(predefined) network model')
+parser.add_argument('--model',          default='mars_moon',       help='(predefined) network model')
 parser.add_argument('--reg-loss',       action='store_true',       help='turn on regularization loss')
 parser.add_argument('--lr',             default=1e-3, type=float,  help='start learning rate')
 parser.add_argument('--adplr',          action='store_true',       help='turn on adaptive learning rate')
@@ -87,21 +76,15 @@ random.seed(0 if params['seed'] is None else params['seed'])
 np.random.seed(0 if params['seed'] is None else params['seed'])
 tf.compat.v1.set_random_seed(0 if params['seed'] is None else params['seed'])
 
-def to_feature(smokestate, ext_const_channel):
-    velocity_x0 = smokestate.velocity.staggered_tensor()[:, :-1:, :, 1:2]
-    velocity_x1 = smokestate.velocity.staggered_tensor()[:, :-1:, 1: , 1:2]
-    velocity_x2 = tf.zeros([smokestate.velocity.data[1].data.shape[0], 100, 1, 1])
-    velocity_x3 = tf.concat((velocity_x1, velocity_x2), axis=2)
-    velocity_x = (velocity_x0 + velocity_x3)/2
+def to_feature(smokestate, ext_const_channel, extA_const_channel):
     with tf.name_scope('to_feature') as scope:
         return math.concat(
             [
                 smokestate.temperature.data,
                 smokestate.Yf.data,
                 smokestate.Yo.data,
-                smokestate.velocity.staggered_tensor()[:, :-1:, :-1:, 0:1],
-                velocity_x[:,:,:-1:,:],
                 tf.constant(shape=smokestate.temperature.data.shape, value=1.0)*math.reshape(value=ext_const_channel, shape=[smokestate._batch_size, 1, 1, 1]),
+                tf.constant(shape=smokestate.temperature.data.shape, value=1.0)*math.reshape(value=extA_const_channel, shape=[smokestate._batch_size, 1, 1, 1]),
             ],
             axis=-1
         )
@@ -192,17 +175,21 @@ def conv2d_block(input_tensor, n_filters, kernel_size=5, batchnorm=False):
     x = keras.layers.Conv2D(filters=n_filters, kernel_size=kernel_size, padding='same', kernel_initializer='he_normal')(input_tensor)
     if batchnorm:
         x = keras.layers.BatchNormalization()(x)
-    x = keras.layers.Activation('relu')(x)
+    x = keras.layers.LeakyReLU()(x)
 
     x = keras.layers.Conv2D(filters=n_filters, kernel_size=kernel_size, padding='same', kernel_initializer='he_normal')(x)
     if batchnorm:
         x = keras.layers.BatchNormalization()(x)
-    x = keras.layers.Activation('relu')(x)
+    x = keras.layers.LeakyReLU()(x)
+
+    x = keras.layers.Conv2D(filters=n_filters, kernel_size=kernel_size, padding='same', kernel_initializer='he_normal')(x)
+    if batchnorm:
+        x = keras.layers.BatchNormalization()(x)
+    x = keras.layers.LeakyReLU()(x)
     return x
 
-def model_unet(tensor_in):
+def model_unet_v1(tensor_in):
     n_filters = 16
-    dropout = 0.5
     batchnorm = False
     with tf.name_scope('model_unet') as scope:
 
@@ -210,26 +197,14 @@ def model_unet(tensor_in):
 
         c1 = conv2d_block(l_input, n_filters = n_filters * 1, kernel_size=5, batchnorm=batchnorm)
         p1 = keras.layers.MaxPooling2D((2,2))(c1)
-        #p1 = keras.layers.Dropout(dropout)(p1)
 
         c2 = conv2d_block(p1, n_filters=n_filters * 2, kernel_size=5, batchnorm=batchnorm)
-        p2 = keras.layers.MaxPooling2D((2, 2))(c2)
-        #p2 = keras.layers.Dropout(dropout)(p2)
-
-        c3 = conv2d_block(p2, n_filters=n_filters * 4, kernel_size=5, batchnorm=batchnorm)
-
         # expansive path
-        u3 = keras.layers.Conv2DTranspose(n_filters*2, kernel_size=5, strides=2, padding='same')(c3)
-        u3 = keras.layers.concatenate([u3, c2])
-        #u3 = keras.layers.Dropout(dropout)(u3)
-        c4 = conv2d_block(u3, n_filters=n_filters*2, kernel_size=5, batchnorm=batchnorm)
-
-        u2 = keras.layers.Conv2DTranspose(n_filters * 1, kernel_size=5, strides=2, padding='same')(c4)
+        u2 = keras.layers.Conv2DTranspose(n_filters*2, kernel_size=5, strides=2, padding='same')(c2)
         u2 = keras.layers.concatenate([u2, c1])
-        #u2 = keras.layers.Dropout(dropout)(u2)
-        c5 = conv2d_block(u2, n_filters=n_filters * 1, kernel_size=5, batchnorm=batchnorm)
+        c3 = conv2d_block(u2, n_filters=n_filters*1, kernel_size=5, batchnorm=batchnorm)
 
-        l_output = keras.layers.Conv2D(filters=3, kernel_size=5, padding='same', kernel_initializer='he_normal')(c5)
+        l_output = keras.layers.Conv2D(filters=3, kernel_size=5, padding='same', kernel_initializer='he_normal')(c3)
         return keras.models.Model(inputs=l_input, outputs=l_output)
 
 def lr_schedule(epoch, current_lr):
@@ -251,31 +226,15 @@ def lr_schedule(epoch, current_lr):
     elif epoch == 11: lr *= 1e-1
     return lr
 
-class Chemical_reaction(SpEnergy):
-    def __init__(self, pressure_solver=GeometricCG()):
-        SpEnergy.__init__(self, pressure_solver)
-
-
-    def step(self, smoke, eq=1.0, amp=1.0, rd=1.0, dt=1.0, gravity=Gravity()):
-        Q1 = 1
-        wkf = Q1 * (Vf) * Wf
-        wko = Q1 * (Vo) * Wo
-
-        wt = hk * (wkf)
-        print('rd shape',rd.shape,'temperature shape', smoke.temperature.data.shape)
-        smoke = smoke.copied_with(Wkf = wkf, Wko = wko, Wt = wt, amp= amp, eq=eq, rd=rd)
-        return super().step(fluid=smoke, dt=dt, obstacles=(), gravity=gravity, density_effects=(), velocity_effects=())
-
-
 class PhifDataset():
     def __init__(self, dirpath, num_frames, num_sims=None, batch_size=1, print_fn=print):
         self.dataSims      = sorted(glob.glob(dirpath + '/sim_0*'))[0:num_sims]
-        self.pathsRd       = [sorted(glob.glob(asim + '/rd_0*.npz')) for asim in self.dataSims]
         self.pathsTemp     = [sorted(glob.glob(asim + '/temp_0*.npz')) for asim in self.dataSims]
         self.pathsYf       = [sorted(glob.glob(asim + '/Yf_0*.npz')) for asim in self.dataSims]
         self.pathsYo       = [sorted(glob.glob(asim + '/Yo_0*.npz')) for asim in self.dataSims]
-        self.pathsVel      = [sorted(glob.glob(asim + '/vel_0*.npz')) for asim in self.dataSims]
-        self.pathsPr       = [sorted(glob.glob(asim + '/pressure_0*.npz')) for asim in self.dataSims]
+        self.pathsTempNR   = [sorted(glob.glob(asim + '/nr_temp_0*.npz')) for asim in self.dataSims]
+        self.pathsYfNR     = [sorted(glob.glob(asim + '/nr_Yf_0*.npz')) for asim in self.dataSims]
+        self.pathsYoNR     = [sorted(glob.glob(asim + '/nr_Yo_0*.npz')) for asim in self.dataSims]
         self.dataFrms      = [ np.arange(num_frames) for _ in self.dataSims ]  # NOTE: may contain different numbers of frames
         self.batchSize     = batch_size
         self.epoch         = None
@@ -299,8 +258,6 @@ class PhifDataset():
                     read_zipped_array(self.filenameToDownscaled(self.pathsTemp[j][i])),
                     read_zipped_array(self.filenameToDownscaled(self.pathsYf[j][i])),
                     read_zipped_array(self.filenameToDownscaled(self.pathsYo[j][i])),
-                    read_zipped_array(self.filenameToDownscaled(self.pathsPr[j][i])),
-                    read_zipped_array(self.filenameToDownscaled(self.pathsVel[j][i])),
                 ) for i in range(num_frames)
             ] for j,asim in enumerate(self.dataSims)
         }
@@ -314,46 +271,32 @@ class PhifDataset():
                 np.mean(np.concatenate([np.absolute(self.dataPreloaded[asim][i][0].reshape(-1)) for asim in self.dataSims for i in range(num_frames)], axis=-1)),  # temp
                 np.mean(np.concatenate([np.absolute(self.dataPreloaded[asim][i][1].reshape(-1)) for asim in self.dataSims for i in range(num_frames)], axis=-1)),  # Yf
                 np.mean(np.concatenate([np.absolute(self.dataPreloaded[asim][i][2].reshape(-1)) for asim in self.dataSims for i in range(num_frames)], axis=-1)),  # Yo
-                np.mean(np.concatenate([np.absolute(self.dataPreloaded[asim][i][3].reshape(-1)) for asim in self.dataSims for i in range(num_frames)], axis=-1)),  # Pr
-                (
-                    np.mean(np.concatenate([np.absolute(self.dataPreloaded[asim][i][4][..., 0].reshape(-1)) for asim in self.dataSims for i in range(num_frames)])),  # vel[0]
-                    np.mean(np.concatenate([np.absolute(self.dataPreloaded[asim][i][4][..., 1].reshape(-1)) for asim in self.dataSims for i in range(num_frames)])),  # vel[1]
-                ),
             ),
             'std': (
                 np.std(np.concatenate([np.absolute(self.dataPreloaded[asim][i][0].reshape(-1)) for asim in self.dataSims for i in range(num_frames)], axis=-1)),  # temp
                 np.std(np.concatenate([np.absolute(self.dataPreloaded[asim][i][1].reshape(-1)) for asim in self.dataSims for i in range(num_frames)], axis=-1)),  # Yf
                 np.std(np.concatenate([np.absolute(self.dataPreloaded[asim][i][2].reshape(-1)) for asim in self.dataSims for i in range(num_frames)], axis=-1)),  # Yo
-                np.std(np.concatenate([np.absolute(self.dataPreloaded[asim][i][3].reshape(-1)) for asim in self.dataSims for i in range(num_frames)], axis=-1)),  # Pr
-                (
-                    np.std(np.concatenate([np.absolute(self.dataPreloaded[asim][i][4][..., 0].reshape(-1)) for asim in self.dataSims for i in range(num_frames)])),  # vel[0]
-                    np.std(np.concatenate([np.absolute(self.dataPreloaded[asim][i][4][..., 1].reshape(-1)) for asim in self.dataSims for i in range(num_frames)])),  # vel[1]
-                ),
             )
         }
 
         self.extConstChannelPerSim = {}  # extConstChannelPerSim['sim_key'][0=first channel, ...]; for now, only equivalence ratio
         self.extConstChannelPerSim_amp = {}
-        self.extConstChannelPerSim_rd = {}
         num_of_ext_channel = 1
         for j, asim in enumerate(self.dataSims):
             with open(asim+'/params.pickle', 'rb') as f:
                 sim_params = pickle.load(f)
                 self.extConstChannelPerSim[asim] = [ sim_params['er'] ] # equivalence ratio
                 self.extConstChannelPerSim_amp[asim] = [sim_params['amp']]  # equivalence ratio
-                self.extConstChannelPerSim_rd[asim] = read_zipped_array(self.filenameToDownscaled(self.pathsRd[j][0]))
 
         self.dataStats.update({
             'ext.mean': [
-                np.mean([np.absolute(self.extConstChannelPerSim[asim][i]) for asim in self.dataSims]) for i in range(num_of_ext_channel)  # equivalence ratio
+                np.mean([np.absolute(self.extConstChannelPerSim_amp[asim][i]) for asim in self.dataSims]) for i in range(num_of_ext_channel)  # equivalence ratio
             ],
             'ext.std': [
-                np.std([np.absolute(self.extConstChannelPerSim[asim][i]) for asim in self.dataSims]) for i in range(num_of_ext_channel)  # equivalence ratio
+                np.std([np.absolute(self.extConstChannelPerSim_amp[asim][i]) for asim in self.dataSims]) for i in range(num_of_ext_channel)  # equivalence ratio
             ]
         })
         self.printFn(self.dataStats)
-        self.printFn(self.extConstChannelPerSim_rd[self.dataSims[0]].shape)
-        #self.printFn(self.extConstChannelPerSim_rd)
 
     def filenameToDownscaled(self, fname):
         return os.path.dirname(fname) + '/' + os.path.basename(fname)
@@ -410,26 +353,6 @@ class PhifDataset():
                 for i in range(self.batchSize)
             ], axis=0) for j in range(consecutive_frames + 1)
         ]
-        p_r = [
-            math.concat([
-                self.dataPreloaded[
-                    self.dataSims[self.epoch[self.batchIdx + i][self.stepIdx][0]]  # sim_key
-                ][
-                    self.epoch[self.batchIdx + i][self.stepIdx][1] + j * with_skip  # steps
-                    ][3]
-                for i in range(self.batchSize)
-            ], axis=0) for j in range(consecutive_frames + 1)
-        ]
-        v_r = [
-            math.concat([
-                self.dataPreloaded[
-                    self.dataSims[self.epoch[self.batchIdx + i][self.stepIdx][0]]  # sim_key
-                ][
-                    self.epoch[self.batchIdx + i][self.stepIdx][1] + j * with_skip  # steps
-                    ][4]
-                for i in range(self.batchSize)
-            ], axis=0) for j in range(consecutive_frames + 1)
-        ]
         ext = [
             self.extConstChannelPerSim[
                 self.dataSims[self.epoch[self.batchIdx+i][self.stepIdx][0]]
@@ -440,17 +363,8 @@ class PhifDataset():
                 self.dataSims[self.epoch[self.batchIdx + i][self.stepIdx][0]]
             ][0] for i in range(self.batchSize)
         ]
+        return [t_r, y_r, yo_r, ext, exA]
 
-        exRd = [
-            self.extConstChannelPerSim_rd[
-                self.dataSims[self.epoch[self.batchIdx + i][self.stepIdx][0]]
-            ][0] for i in range(self.batchSize)
-        ]
-
-        return [t_r, y_r, yo_r, p_r, v_r, ext, exA, exRd]
-
-
-simulator_lo = Chemical_reaction()
 
 dataset = PhifDataset(
     dirpath=params['train'],
@@ -471,15 +385,14 @@ if params['resume']>0:
 
 Rlo = list(dataset.resolution)
 
-st_co = SpFluid(Domain([params['res'], params['res']], box=AABox(0, [params['bx'], params['bx']]), boundaries=[OPEN,CLOSED]), buoyancy_factor=0, batch_size=params['sbatch'])
-st_gt = [ SpFluid(Domain([params['res'], params['res']], box=AABox(0, [params['bx'], params['bx']]), boundaries=[OPEN,CLOSED]), buoyancy_factor=0, batch_size=params['sbatch']) for _ in range(params['msteps']) ]
+st_co = SpFluid(Domain([params['res'], params['res']]), buoyancy_factor=0, batch_size=params['sbatch'])
+st_gt = [ SpFluid(Domain([params['res'], params['res']]), buoyancy_factor=0, batch_size=params['sbatch']) for _ in range(params['msteps']) ]
 
 with tf.name_scope('input') as scope:
     with tf.name_scope('co') as scope: tf_st_co_in =   phi.tf.util.placeholder_like(st_co)
     with tf.name_scope('lr') as scope: tf_vr_lr_in =   tf.placeholder(tf.float32, shape=[])  # learning rate
     with tf.name_scope('er') as scope: tf_st_er_in =   tf.placeholder(tf.float32, shape=[params['sbatch']])  # equivalence ratio
     with tf.name_scope('amp') as scope: tf_st_amp_in = tf.placeholder(tf.float32, shape=[params['sbatch']])  # amp
-    with tf.name_scope('rd') as scope: tf_st_rd_in = tf.placeholder(tf.float32, shape=[params['sbatch'], params['res'], params['res'],1])  # rd
     with tf.name_scope('gt') as scope: tf_st_gt_in = [ phi.tf.util.placeholder_like(st_co) for _ in range(params['msteps']) ]
 
 if (params['train'] is None):
@@ -497,7 +410,7 @@ tf.compat.v1.keras.backend.set_session(tf_session)
 
 with tf.name_scope('training') as scope:
     netModel = eval('model_{}'.format(params['model']))
-    model = netModel(to_feature(tf_st_co_in, tf_st_er_in))
+    model = netModel(to_feature(tf_st_co_in, tf_st_er_in, tf_st_amp_in))
 
     with tf.name_scope('corre') as scope:
         tf_st_co_prd, tf_cv_md = [], []
@@ -505,22 +418,14 @@ with tf.name_scope('training') as scope:
             with tf.name_scope('step_w_pred') as scope:
                 with tf.name_scope('step') as scope:
                     tf_st_co_prd += [
-                        simulator_lo.step(
-                            tf_st_co_in if i == 0 else tf_st_co_prd[-1],
-                            eq=tf_st_er_in,
-                            amp=tf_st_amp_in,
-                            rd = tf_st_rd_in,
-                            dt=0.0004
-                        )
+                        tf_st_co_in if i == 0 else tf_st_co_prd[-1]
                     ]
 
                 with tf.name_scope('pred') as scope:
                     tf_cv_md += [
                         model(
-                            (to_feature(tf_st_co_prd[-1], tf_st_er_in) - ([*(dataset.dataStats['mean'][0:3]), # temperature, Yf, Yo
-                                                                           *(dataset.dataStats['mean'][4]),
-                                                                           0.0])) / ([*(dataset.dataStats['std'][0:3]), # temperature, Yf, Yo
-                                                                                      *(dataset.dataStats['std'][4]), 1.0])
+                            (to_feature(tf_st_co_prd[-1], tf_st_er_in, tf_st_amp_in) - ([*(dataset.dataStats['mean'][0:3]),
+                                                                                        0.0, dataset.dataStats['ext.mean'][0]])) / ([*(dataset.dataStats['std'][0:3]), 1.0, dataset.dataStats['ext.std'][0]])
                         )*([*(dataset.dataStats['std'][0:3])]) + ([*(dataset.dataStats['mean'][0:3])])
                     ]
                 #print('tf_cv_md', tf_cv_md[-1])
@@ -597,11 +502,11 @@ for j in range(params['epochs']):  # training
     for ib in range(dataset.numOfBatchs):   # for each batch
         for i in range(dataset.numOfSteps):  # for each step
             adata = dataset.getData(consecutive_frames=params['msteps'], with_skip=1)
-            er_nr, amp_nr, rd_data = adata[5], adata[6], adata[7]  # equivalence ratio, amp
-            st_co = st_co.copied_with(temperature=adata[0][0], Yf=adata[1][0], Yo=adata[2][0], pressure=adata[3][0], velocity=adata[4][0])
-            st_gt = [ st_gt[k].copied_with(temperature=adata[0][k+1], Yf=adata[1][k+1], Yo=adata[2][k+1], velocity=adata[4][k+1]) for k in range(params['msteps']) ]
+            er_nr, amp_nr = adata[3], adata[4] # equivalence ratio, amp
+            st_co = st_co.copied_with(temperature=adata[0][0], Yf=adata[1][0], Yo=adata[2][0])
+            st_gt = [ st_gt[k].copied_with(temperature=adata[0][k+1], Yf=adata[1][k+1], Yo=adata[2][k+1]) for k in range(params['msteps']) ]
 
-            my_feed_dict = { tf_st_co_in: st_co, tf_st_er_in: er_nr, tf_st_amp_in: amp_nr, tf_st_rd_in: rd_data, tf_vr_lr_in: current_lr }
+            my_feed_dict = { tf_st_co_in: st_co, tf_st_er_in: er_nr, tf_st_amp_in: amp_nr, tf_vr_lr_in: current_lr }
             my_feed_dict.update(zip(tf_st_gt_in, st_gt))
 
             summary, _, l2 = sess.run([tf_summary_merged, train_step, total_loss], my_feed_dict)

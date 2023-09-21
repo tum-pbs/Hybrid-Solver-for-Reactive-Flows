@@ -36,7 +36,11 @@ uniform-Bunsen-react-testset: data_generation.py
 # Training models
 
 # SOL-1
-U-Bunsen-unet-sol1: hybrid_nn_pde_train_unet_MFP_v1.py # NOTE: don't test with "-n 1" (normalization problem because std(Re)=0!)
+U-Bunsen-hyb-unet-sol1: hybrid_nn_pde_train_unet_MFP_v1.py
+	python $^ --tf $@/tf --log $@/tf/run.log --epochs=100 --lr 0.0001 -l 100 -t 300 -m 1 -n 9 -b 3 --bx 1 --seed 0 --gpu '0' --cuda \
+		--train uniform-Bunsen-react-set
+
+U-Bunsen-pdd-resnet-sol1: pdd_train_resnet.py
 	python $^ --tf $@/tf --log $@/tf/run.log --epochs=100 --lr 0.0001 -l 100 -t 300 -m 1 -n 9 -b 3 --bx 1 --seed 0 --gpu '0' --cuda \
 		--train uniform-Bunsen-react-set
 
@@ -44,7 +48,16 @@ U-Bunsen-unet-sol1: hybrid_nn_pde_train_unet_MFP_v1.py # NOTE: don't test with "
 # Run tests
 
 # SOL-1
-U-Bunsen-unet-sol1/run_test: hybrid_nn_pde_apply_v1.py
+U-Bunsen-hyb-unet-sol1/run_test: hybrid_nn_pde_apply_v1.py
+	for i in `seq 0 1`; do \
+		 python $^ -o $@ \
+		    --stats `dirname $@`/tf/dataStats.pickle \
+            --model `dirname $@`/tf/model.h5 --gpu "-1" \
+            --testset uniform-Bunsen-react-testset \
+            -r 32 -b 3 --bIdx `echo "($$i) " | bc -l` -l 100 --er 1 -t 300; \
+	done
+
+U-Bunsen-pdd-resnet-sol1/run_test: pdd_apply.py
 	for i in `seq 0 1`; do \
 		 python $^ -o $@ \
 		    --stats `dirname $@`/tf/dataStats.pickle \
