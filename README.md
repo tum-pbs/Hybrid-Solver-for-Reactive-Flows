@@ -1,6 +1,6 @@
 # Hybrid Solver for Reactive Flows
-This is the source code repository for the Data-Centric Engineering paper "Incomplete to complete multiphysics forecasting - a hybrid approach for learning unknown phenomena" by Nilam Tathawadekar, Nguyen Anh Khoa Doan, Camilo F. Silva, Nils Thuerey.
-
+This is the source code repository for the Data-Centric Engineering paper "Incomplete to complete multiphysics forecasting - a hybrid approach for learning unknown phenomena" by Nilam Tathawadekar, Nguyen Anh Khoa Doan, Camilo F. Silva, Nils Thuerey: 
+[Full Paper](https://www.cambridge.org/core/journals/data-centric-engineering/article/incomplete-to-complete-multiphysics-forecasting-a-hybrid-approach-for-learning-unknown-phenomena/23CEF49F19D602E5D7D86FFB9587B259#)
 
 
 # Abstract:
